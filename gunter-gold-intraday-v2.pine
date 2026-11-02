@@ -1,0 +1,287 @@
+//@version=6
+strategy("Gunter BE Gold Intraday V2",
+     overlay=true,
+     process_orders_on_close=true,
+     pyramiding=0,
+     margin_long=100,
+     margin_short=100,
+     default_qty_type=strategy.percent_of_equity,
+     default_qty_value=10)
+
+// === Inputs ===
+emaFastLen = input.int(9, "Fast EMA Length", minval=1)
+emaSlowLen = input.int(21, "Slow EMA Length", minval=1)
+bbLen      = input.int(20, "BB Mid (SMA) Length", minval=1)
+atrLen     = input.int(14, "ATR Length", minval=1)
+
+atrSLmult = input.float(1.5, "ATR Stop Multiplier", minval=0.5, step=0.1)
+atrTPmult = input.float(2.5, "ATR Take Profit Multiplier", minval=0.5, step=0.1)
+
+// === Higher-Timeframe Filter ===
+useHTFFilter = input.bool(false, "Use HTF Trend Filter")
+htfTimeframe = input.timeframe("60", "Higher Timeframe")
+htfFastLen   = input.int(9, "HTF Fast EMA Length", minval=1)
+htfSlowLen   = input.int(21, "HTF Slow EMA Length", minval=1)
+showHTFEMAs  = input.bool(false, "Plot HTF EMAs")
+
+// The selected HTF must be higher than the chart timeframe.
+if useHTFFilter and timeframe.in_seconds(htfTimeframe) <= timeframe.in_seconds()
+    runtime.error("Higher Timeframe must be greater than the chart timeframe.")
+
+// Use the previous, closed HTF candle so the filter does not use a developing HTF value.
+[htfEmaFast, htfEmaSlow] = request.security(
+     syminfo.tickerid,
+     htfTimeframe,
+     [ta.ema(close, htfFastLen)[1], ta.ema(close, htfSlowLen)[1]],
+     gaps=barmerge.gaps_off,
+     lookahead=barmerge.lookahead_on)
+
+htfBullish = htfEmaFast > htfEmaSlow
+htfBearish = htfEmaFast < htfEmaSlow
+
+htfBuyAllowed  = not useHTFFilter or htfBullish
+htfSellAllowed = not useHTFFilter or htfBearish
+
+// === Break-Even Settings ===
+useBreakEven = input.bool(true, "Enable Break-Even Stop")
+beTriggerR = input.float(
+     1.0,
+     "Break-Even Activation (R)",
+     minval=0.1,
+     step=0.1,
+     tooltip="Move the stop to the entry price after price reaches this multiple of the initial risk. Default is 1R.")
+
+// === Session Filters (UTC) ===
+sessionAsia   = input.bool(true, "Trade Asian Session (00:00–08:00 UTC)")
+sessionLondon = input.bool(true, "Trade London Session (08:00–16:00 UTC)")
+sessionNY     = input.bool(false, "Trade New York Session (16:00–23:59 UTC)")
+
+// === Weekday Filters ===
+tradeMonday    = input.bool(true, "Trade Monday")
+tradeTuesday   = input.bool(true, "Trade Tuesday")
+tradeWednesday = input.bool(true, "Trade Wednesday")
+tradeThursday  = input.bool(true, "Trade Thursday")
+tradeFriday    = input.bool(false, "Trade Friday")
+
+// === Core Calculations ===
+emaFast = ta.ema(close, emaFastLen)
+emaSlow = ta.ema(close, emaSlowLen)
+bbMid   = ta.sma(close, bbLen)
+vwapVal = ta.vwap(close)
+atrVal  = ta.atr(atrLen)
+
+// ATR levels, calculated from the signal bar's close
+atrStopBuy  = close - atrSLmult * atrVal
+atrStopSell = close + atrSLmult * atrVal
+atrTPBuy    = close + atrTPmult * atrVal
+atrTPSell   = close - atrTPmult * atrVal
+
+// === Crossover Logic ===
+bullCross = ta.crossover(emaFast, bbMid)
+bearCross = ta.crossunder(emaFast, bbMid)
+
+// === Signal Conditions ===
+buySignal =
+     bullCross and
+     close > emaSlow and
+     close > vwapVal and
+     htfBuyAllowed
+
+sellSignal =
+     bearCross and
+     close < emaSlow and
+     close < vwapVal and
+     htfSellAllowed
+
+// === Session Filter ===
+hourUTC = hour(time, "UTC")
+
+inAsia   = sessionAsia and hourUTC >= 0 and hourUTC < 8
+inLondon = sessionLondon and hourUTC >= 8 and hourUTC < 16
+inNY     = sessionNY and hourUTC >= 16 and hourUTC < 24
+
+sessionAllowed = inAsia or inLondon or inNY
+
+// === Weekday Filter ===
+dayOfWeek = dayofweek(time, "UTC")
+
+weekdayAllowed =
+     (dayOfWeek == dayofweek.monday and tradeMonday) or
+     (dayOfWeek == dayofweek.tuesday and tradeTuesday) or
+     (dayOfWeek == dayofweek.wednesday and tradeWednesday) or
+     (dayOfWeek == dayofweek.thursday and tradeThursday) or
+     (dayOfWeek == dayofweek.friday and tradeFriday)
+
+// === Final Trade Permission ===
+tradeAllowed = sessionAllowed and weekdayAllowed
+validBuy  = barstate.isconfirmed and strategy.position_size == 0 and buySignal and tradeAllowed
+validSell = barstate.isconfirmed and strategy.position_size == 0 and sellSignal and tradeAllowed
+
+// === Break-Even State ===
+var float activeStop = na
+var float activeTarget = na
+var float initialRisk = na
+var bool beActivated = false
+
+// Clear stored levels when flat, unless a new entry signal is occurring.
+if strategy.position_size == 0 and not validBuy and not validSell
+    activeStop := na
+    activeTarget := na
+    initialRisk := na
+    beActivated := false
+
+// === Manage Open Long Position ===
+if strategy.position_size > 0 and not na(activeStop) and not na(initialRisk)
+    longEntryPrice = strategy.position_avg_price
+    longBETrigger = longEntryPrice + initialRisk * beTriggerR
+
+    if useBreakEven and not beActivated and high >= longBETrigger
+        beActivated := true
+        activeStop := math.max(activeStop, longEntryPrice)
+
+        alert("Break-even activated for LONG | " + syminfo.ticker +
+             " | Entry/Stop: " + str.tostring(longEntryPrice, format.mintick),
+             alert.freq_once_per_bar_close)
+
+    strategy.exit("BUY Exit", "BUY", stop=activeStop, limit=activeTarget)
+
+// === Manage Open Short Position ===
+if strategy.position_size < 0 and not na(activeStop) and not na(initialRisk)
+    shortEntryPrice = strategy.position_avg_price
+    shortBETrigger = shortEntryPrice - initialRisk * beTriggerR
+
+    if useBreakEven and not beActivated and low <= shortBETrigger
+        beActivated := true
+        activeStop := math.min(activeStop, shortEntryPrice)
+
+        alert("Break-even activated for SHORT | " + syminfo.ticker +
+             " | Entry/Stop: " + str.tostring(shortEntryPrice, format.mintick),
+             alert.freq_once_per_bar_close)
+
+    strategy.exit("SELL Exit", "SELL", stop=activeStop, limit=activeTarget)
+
+// === Strategy Entries ===
+if validBuy
+    activeStop := atrStopBuy
+    activeTarget := atrTPBuy
+    initialRisk := math.abs(close - activeStop)
+    beActivated := false
+
+    strategy.entry("BUY", strategy.long, alert_message="BUY ENTRY")
+    alert("BUY | " + syminfo.ticker + " | Entry " + str.tostring(close, format.mintick) + " | SL " + str.tostring(activeStop, format.mintick) + " | TP " + str.tostring(activeTarget, format.mintick), alert.freq_once_per_bar_close)
+    strategy.exit("BUY Exit", "BUY", stop=activeStop, limit=activeTarget)
+
+if validSell
+    activeStop := atrStopSell
+    activeTarget := atrTPSell
+    initialRisk := math.abs(activeStop - close)
+    beActivated := false
+
+    strategy.entry("SELL", strategy.short, alert_message="SELL ENTRY")
+    alert("SELL | " + syminfo.ticker + " | Entry " + str.tostring(close, format.mintick) + " | SL " + str.tostring(activeStop, format.mintick) + " | TP " + str.tostring(activeTarget, format.mintick), alert.freq_once_per_bar_close)
+    strategy.exit("SELL Exit", "SELL", stop=activeStop, limit=activeTarget)
+
+// === Plots ===
+plot(emaFast, "EMA Fast", color=color.blue)
+plot(emaSlow, "EMA Slow", color=color.purple)
+plot(bbMid, "BB Mid", color=color.orange)
+plot(vwapVal, "VWAP", color=color.aqua)
+
+plot(showHTFEMAs and useHTFFilter ? htfEmaFast : na,
+     "HTF EMA Fast", color=color.new(color.blue, 35), linewidth=2)
+plot(showHTFEMAs and useHTFFilter ? htfEmaSlow : na,
+     "HTF EMA Slow", color=color.new(color.purple, 35), linewidth=2)
+
+hasTradeLevels = not na(activeStop) and not na(activeTarget)
+
+plot(hasTradeLevels ? activeStop : na,
+     "Active Stop (ATR / Break-Even)",
+     color=color.red,
+     style=plot.style_linebr,
+     linewidth=2)
+
+plot(hasTradeLevels ? activeTarget : na,
+     "Active Take Profit",
+     color=color.green,
+     style=plot.style_linebr)
+
+// === Small Boxed Buy/Sell Markers ===
+plotshape(validBuy, title="Buy Signal", text="B",
+     style=shape.labelup, location=location.belowbar,
+     color=color.green, textcolor=color.white, size=size.small)
+
+plotshape(validSell, title="Sell Signal", text="S",
+     style=shape.labeldown, location=location.abovebar,
+     color=color.red, textcolor=color.white, size=size.small)
+
+// Visual context only: never used in entry or exit conditions.
+vZones = input.bool(true, "Support / Resistance Boxes", group="Visual Structure")
+vGaps = input.bool(true, "FVG Boxes", group="Visual Structure")
+vBreaks = input.bool(true, "BOS / CHoCH Lines", group="Visual Structure")
+vN = input.int(5, "Swing Length", minval=2, maxval=100, group="Visual Structure")
+vExt = input.int(30, "Box Extension", minval=1, maxval=100, group="Visual Structure")
+vPad = input.float(0.3, "Zone Width (ATR)", minval=0.05, group="Visual Structure")
+vPH = ta.pivothigh(high, vN, vN)
+vPL = ta.pivotlow(low, vN, vN)
+var float vHigh = na
+var float vLow = na
+var int vHB = na
+var int vLB = na
+var bool vHBroken = false
+var bool vLBroken = false
+var int vBias = 0
+var box vRes = na
+var box vSup = na
+var box vBullGap = na
+var box vBearGap = na
+if barstate.isconfirmed
+    if not na(vPH)
+        vHigh := vPH
+        vHB := bar_index - vN
+        vHBroken := false
+        if vZones
+            box.delete(vRes)
+            vRes := box.new(bar_index, vPH + atrVal * vPad, bar_index + vExt, vPH - atrVal * vPad, bgcolor=color.new(color.red, 90), border_color=color.new(color.red, 55), text="RESISTANCE", text_color=color.red, text_size=size.tiny)
+    if not na(vPL)
+        vLow := vPL
+        vLB := bar_index - vN
+        vLBroken := false
+        if vZones
+            box.delete(vSup)
+            vSup := box.new(bar_index, vPL + atrVal * vPad, bar_index + vExt, vPL - atrVal * vPad, bgcolor=color.new(color.green, 90), border_color=color.new(color.green, 55), text="SUPPORT", text_color=color.green, text_size=size.tiny)
+    if not na(vHigh) and not vHBroken and close > vHigh
+        vHBroken := true
+        if vBreaks
+            line.new(math.max(vHB, bar_index - 9999), vHigh, bar_index, vHigh, color=color.green)
+            label.new(int(math.avg(math.max(vHB, bar_index - 9999), bar_index)), vHigh + atrVal * 0.08, vBias == -1 ? "CHoCH" : "BOS", style=label.style_none, textcolor=color.green, size=size.tiny)
+        vBias := 1
+        box.delete(vRes)
+        vRes := na
+    if not na(vLow) and not vLBroken and close < vLow
+        vLBroken := true
+        if vBreaks
+            line.new(math.max(vLB, bar_index - 9999), vLow, bar_index, vLow, color=color.red)
+            label.new(int(math.avg(math.max(vLB, bar_index - 9999), bar_index)), vLow + atrVal * 0.08, vBias == 1 ? "CHoCH" : "BOS", style=label.style_none, textcolor=color.red, size=size.tiny)
+        vBias := -1
+        box.delete(vSup)
+        vSup := na
+    if not na(vBullGap) and low <= box.get_bottom(vBullGap)
+        box.delete(vBullGap)
+        vBullGap := na
+    if not na(vBearGap) and high >= box.get_top(vBearGap)
+        box.delete(vBearGap)
+        vBearGap := na
+    if vGaps and low > high[2]
+        box.delete(vBullGap)
+        vBullGap := box.new(bar_index, low, bar_index + vExt, high[2], bgcolor=color.new(color.teal, 88), border_color=color.new(color.teal, 60), text="BULL FVG", text_color=color.teal, text_size=size.tiny)
+    if vGaps and high < low[2]
+        box.delete(vBearGap)
+        vBearGap := box.new(bar_index, low[2], bar_index + vExt, high, bgcolor=color.new(color.orange, 88), border_color=color.new(color.orange, 60), text="BEAR FVG", text_color=color.orange, text_size=size.tiny)
+    if not na(vRes)
+        box.set_right(vRes, bar_index + vExt)
+    if not na(vSup)
+        box.set_right(vSup, bar_index + vExt)
+    if not na(vBullGap)
+        box.set_right(vBullGap, bar_index + vExt)
+    if not na(vBearGap)
+        box.set_right(vBearGap, bar_index + vExt)
